@@ -1,441 +1,424 @@
-provider "aws" {
-  region = "ap-northeast-2" # Seoul region
-}
-
-# VPC configuration
-resource "aws_vpc" "chatbot_vpc" {
-  cidr_block           = "10.0.0.0/16"
-  enable_dns_hostnames = true
-  enable_dns_support   = true
-  
-  tags = {
-    Name        = "chatbot-vpc"
-    project     = "ai-infra"
-    environment = "production"
-  }
-}
-
-# Public subnet
-resource "aws_subnet" "public_subnet" {
-  vpc_id                  = aws_vpc.chatbot_vpc.id
-  cidr_block              = "10.0.1.0/24"
-  availability_zone       = "ap-northeast-2a"
-  map_public_ip_on_launch = true
-  
-  tags = {
-    Name        = "chatbot-public-subnet"
-    project     = "ai-infra"
-    environment = "production"
-  }
-}
-
-# Private subnet
-resource "aws_subnet" "private_subnet" {
-  vpc_id            = aws_vpc.chatbot_vpc.id
-  cidr_block        = "10.0.2.0/24"
-  availability_zone = "ap-northeast-2a"
-  
-  tags = {
-    Name        = "chatbot-private-subnet"
-    project     = "ai-infra"
-    environment = "production"
-  }
-}
-
-# Internet Gateway
-resource "aws_internet_gateway" "igw" {
-  vpc_id = aws_vpc.chatbot_vpc.id
-  
-  tags = {
-    Name        = "chatbot-igw"
-    project     = "ai-infra"
-    environment = "production"
-  }
-}
-
-# Route table for public subnet
-resource "aws_route_table" "public_rt" {
-  vpc_id = aws_vpc.chatbot_vpc.id
-  
-  route {
-    cidr_block = "0.0.0.0/0"
-    gateway_id = aws_internet_gateway.igw.id
-  }
-  
-  tags = {
-    Name        = "chatbot-public-rt"
-    project     = "ai-infra"
-    environment = "production"
-  }
-}
-
-# Route table association
-resource "aws_route_table_association" "public" {
-  subnet_id      = aws_subnet.public_subnet.id
-  route_table_id = aws_route_table.public_rt.id
-}
-
-# Security group for EC2 instance
-resource "aws_security_group" "chatbot_sg" {
-  name        = "chatbot-security-group"
-  description = "Security group for chatbot service"
-  vpc_id      = aws_vpc.chatbot_vpc.id
-  
-  ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "SSH"
-  }
-  
-  ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "HTTP"
-  }
-  
-  ingress {
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-    description = "HTTPS"
-  }
-  
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-  
-  tags = {
-    Name        = "chatbot-sg"
-    project     = "ai-infra"
-    environment = "production"
-  }
-}
-
-# IAM role for EC2 instance
-resource "aws_iam_role" "chatbot_role" {
-  name = "chatbot-role"
-  
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "ec2.amazonaws.com"
-        }
-      }
-    ]
-  })
-  
-  tags = {
-    project     = "ai-infra"
-    environment = "production"
-  }
-}
-
-# IAM instance profile
-resource "aws_iam_instance_profile" "chatbot_profile" {
-  name = "chatbot-profile"
-  role = aws_iam_role.chatbot_role.name
-}
-
-# Attaching AmazonS3ReadOnlyAccess policy to the role
-resource "aws_iam_role_policy_attachment" "s3_read_attach" {
-  role       = aws_iam_role.chatbot_role.name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"
-}
-
-# EC2 instance with GPU (g5.xlarge)
-resource "aws_instance" "chatbot_server" {
-  ami                    = "ami-0c9c942bd7bf36742" # Amazon Linux 2 with NVIDIA drivers, Deep Learning AMI
-  instance_type          = "g5.xlarge"  # g5.xlarge with A10G GPU
-  key_name               = "chatbot-key"
-  subnet_id              = aws_subnet.public_subnet.id
-  vpc_security_group_ids = [aws_security_group.chatbot_sg.id]
-  iam_instance_profile   = aws_iam_instance_profile.chatbot_profile.name
-  
-  root_block_device {
-    volume_size = 100
-    volume_type = "gp3"
-  }
-  
-  tags = {
-    Name        = "chatbot-server"
-    project     = "ai-infra"
-    environment = "production"
-  }
-}
-
-# Elastic IP for the EC2 instance
-resource "aws_eip" "chatbot_eip" {
-  instance = aws_instance.chatbot_server.id
-  domain   = "vpc"
-  
-  tags = {
-    Name        = "chatbot-eip"
-    project     = "ai-infra"
-    environment = "production"
-  }
-}
-
-# S3 bucket for model storage
-resource "aws_s3_bucket" "model_bucket" {
-  bucket = "chatbot-model-storage-2026"
-  
-  tags = {
-    Name        = "chatbot-model-storage"
-    project     = "ai-infra"
-    environment = "production"
-  }
-}
-
-# S3 bucket ACL
-resource "aws_s3_bucket_ownership_controls" "model_bucket_ownership" {
-  bucket = aws_s3_bucket.model_bucket.id
-  rule {
-    object_ownership = "BucketOwnerPreferred"
-  }
-}
-
-resource "aws_s3_bucket_acl" "model_bucket_acl" {
-  depends_on = [aws_s3_bucket_ownership_controls.model_bucket_ownership]
-  bucket = aws_s3_bucket.model_bucket.id
-  acl    = "private"
-}
-
-# CloudWatch Log Group for the chatbot application
-resource "aws_cloudwatch_log_group" "chatbot_logs" {
-  name              = "/aws/chatbot-service"
-  retention_in_days = 14
-  
-  tags = {
-    project     = "ai-infra"
-    environment = "production"
-  }
-}
-
-# Application Load Balancer
-resource "aws_lb" "chatbot_alb" {
-  name               = "chatbot-alb"
-  internal           = false
-  load_balancer_type = "application"
-  security_groups    = [aws_security_group.chatbot_sg.id]
-  subnets            = [aws_subnet.public_subnet.id]
-  
-  tags = {
-    Name        = "chatbot-alb"
-    project     = "ai-infra"
-    environment = "production"
-  }
-}
-
-# ALB Target Group
-resource "aws_lb_target_group" "chatbot_tg" {
-  name     = "chatbot-target-group"
-  port     = 80
-  protocol = "HTTP"
-  vpc_id   = aws_vpc.chatbot_vpc.id
-  
-  health_check {
-    path                = "/health"
-    interval            = 30
-    timeout             = 5
-    healthy_threshold   = 2
-    unhealthy_threshold = 2
-    matcher             = "200"
-  }
-  
-  tags = {
-    project     = "ai-infra"
-    environment = "production"
-  }
-}
-
-# ALB Target Group Attachment
-resource "aws_lb_target_group_attachment" "chatbot_tg_attachment" {
-  target_group_arn = aws_lb_target_group.chatbot_tg.arn
-  target_id        = aws_instance.chatbot_server.id
-  port             = 80
-}
-
-# ALB Listener
-resource "aws_lb_listener" "chatbot_listener" {
-  load_balancer_arn = aws_lb.chatbot_alb.arn
-  port              = 80
-  protocol          = "HTTP"
-  
-  default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.chatbot_tg.arn
-  }
-}
-
-# Route 53 Record (Assuming a hosted zone exists)
-resource "aws_route53_record" "chatbot_dns" {
-  zone_id = "Z1234567890ABC" # Replace with your hosted zone ID
-  name    = "chatbot.example.com" # Replace with your domain
-  type    = "A"
-  
-  alias {
-    name                   = aws_lb.chatbot_alb.dns_name
-    zone_id                = aws_lb.chatbot_alb.zone_id
-    evaluate_target_health = true
-  }
-}
-
-# Auto Scaling Group
-resource "aws_launch_template" "chatbot_lt" {
-  name_prefix   = "chatbot-lt"
-  image_id      = "ami-0c9c942bd7bf36742" # Amazon Linux 2 with NVIDIA drivers
-  instance_type = "g5.xlarge"
-  key_name      = "chatbot-key"
-  
-  network_interfaces {
-    associate_public_ip_address = true
-    security_groups             = [aws_security_group.chatbot_sg.id]
-  }
-  
-  iam_instance_profile {
-    name = aws_iam_instance_profile.chatbot_profile.name
-  }
-  
-  tag_specifications {
-    resource_type = "instance"
-    
-    tags = {
-      Name        = "chatbot-asg-instance"
-      project     = "ai-infra"
-      environment = "production"
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 4.0"
     }
   }
-  
-  user_data = base64encode(<<-EOF
+}
+
+provider "google" {
+  region = "asia-northeast3"  # 서울 리전
+}
+
+# 프로젝트 변수
+variable "project_id" {
+  description = "GCP 프로젝트 ID"
+  type        = string
+}
+
+# VPC 네트워크
+resource "google_compute_network" "chatbot_network" {
+  name                    = "chatbot-network"
+  auto_create_subnetworks = false
+  project                 = var.project_id
+}
+
+# 서브넷 생성
+resource "google_compute_subnetwork" "chatbot_subnet" {
+  name          = "chatbot-subnet"
+  ip_cidr_range = "10.0.0.0/24"
+  network       = google_compute_network.chatbot_network.id
+  region        = "asia-northeast3"
+  project       = var.project_id
+}
+
+# 방화벽 규칙
+resource "google_compute_firewall" "chatbot_firewall" {
+  name    = "chatbot-firewall"
+  network = google_compute_network.chatbot_network.id
+  project = var.project_id
+
+  allow {
+    protocol = "tcp"
+    ports    = ["22", "80", "443", "8080"]
+  }
+
+  source_ranges = ["0.0.0.0/0"]
+  target_tags   = ["chatbot-server"]
+}
+
+# GPU VM 인스턴스
+resource "google_compute_instance" "chatbot_server" {
+  name         = "chatbot-server"
+  machine_type = "g2-standard-8"  # 8 vCPUs, 32GB 메모리, 1 NVIDIA L4 GPU
+  zone         = "asia-northeast3-a"
+  project      = var.project_id
+
+  boot_disk {
+    initialize_params {
+      image = "debian-cloud/debian-11"
+      size  = 100  # GB
+      type  = "pd-balanced"
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.chatbot_subnet.id
+    access_config {
+      # 외부 IP 할당
+    }
+  }
+
+  guest_accelerator {
+    type  = "nvidia-l4"
+    count = 1
+  }
+
+  scheduling {
+    on_host_maintenance = "TERMINATE"  # GPU VM의 경우 필수
+    automatic_restart   = true
+    preemptible        = false
+  }
+
+  # GPU 드라이버 설치 스크립트
+  metadata_startup_script = <<-EOF
     #!/bin/bash
-    yum update -y
-    yum install -y git docker
-    systemctl start docker
-    systemctl enable docker
-    
-    # Clone the repository
-    git clone https://github.com/hyungtakChoi/chatbot-workload-icon.git /opt/chatbot
-    
-    # Download model files from S3
-    aws s3 sync s3://chatbot-model-storage-2026/models /opt/chatbot/models
-    
-    # Start the application
-    cd /opt/chatbot
-    nohup python3 gpt_inference.py > /var/log/chatbot.log 2>&1 &
+    apt-get update
+    apt-get install -y build-essential python3-pip
+    pip3 install torch numpy transformers
+    # GPU 드라이버 설치
+    curl https://raw.githubusercontent.com/GoogleCloudPlatform/compute-gpu-installation/main/linux/install_gpu_driver.py -o install_gpu_driver.py
+    python3 install_gpu_driver.py
   EOF
-  )
-}
 
-resource "aws_autoscaling_group" "chatbot_asg" {
-  desired_capacity    = 1
-  max_size            = 3
-  min_size            = 1
-  vpc_zone_identifier = [aws_subnet.public_subnet.id]
-  
-  launch_template {
-    id      = aws_launch_template.chatbot_lt.id
-    version = "$Latest"
+  service_account {
+    scopes = ["cloud-platform"]
   }
-  
-  target_group_arns = [aws_lb_target_group.chatbot_tg.arn]
-  
-  tag {
-    key                 = "project"
-    value               = "ai-infra"
-    propagate_at_launch = true
-  }
-  
-  tag {
-    key                 = "environment"
-    value               = "production"
-    propagate_at_launch = true
-  }
-}
 
-# CloudWatch Alarms for scaling policies
-resource "aws_cloudwatch_metric_alarm" "high_cpu" {
-  alarm_name          = "chatbot-high-cpu-alarm"
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  evaluation_periods  = 2
-  metric_name         = "CPUUtilization"
-  namespace           = "AWS/EC2"
-  period              = 120
-  statistic           = "Average"
-  threshold           = 80
-  
-  dimensions = {
-    AutoScalingGroupName = aws_autoscaling_group.chatbot_asg.name
-  }
-  
-  alarm_description = "This alarm triggers when CPU usage is high"
-  alarm_actions     = [aws_autoscaling_policy.scale_up.arn]
-  
-  tags = {
+  tags = ["chatbot-server"]
+
+  labels = {
     project     = "ai-infra"
     environment = "production"
   }
 }
 
-resource "aws_autoscaling_policy" "scale_up" {
-  name                   = "chatbot-scale-up"
-  scaling_adjustment     = 1
-  adjustment_type        = "ChangeInCapacity"
-  cooldown               = 300
-  autoscaling_group_name = aws_autoscaling_group.chatbot_asg.name
-}
+# Cloud SQL 인스턴스 (메타데이터 저장)
+resource "google_sql_database_instance" "chatbot_db" {
+  name             = "chatbot-db"
+  database_version = "POSTGRES_14"
+  region           = "asia-northeast3"
+  project          = var.project_id
 
-resource "aws_cloudwatch_metric_alarm" "low_cpu" {
-  alarm_name          = "chatbot-low-cpu-alarm"
-  comparison_operator = "LessThanOrEqualToThreshold"
-  evaluation_periods  = 2
-  metric_name         = "CPUUtilization"
-  namespace           = "AWS/EC2"
-  period              = 120
-  statistic           = "Average"
-  threshold           = 20
-  
-  dimensions = {
-    AutoScalingGroupName = aws_autoscaling_group.chatbot_asg.name
+  settings {
+    tier              = "db-custom-2-4096"  # 2 vCPU, 4GB RAM
+    disk_size         = 20  # GB
+    disk_type         = "PD_SSD"
+    availability_type = "ZONAL"  # REGIONAL로 설정하면 고가용성 활성화
+
+    backup_configuration {
+      enabled            = true
+      start_time         = "02:00"
+      binary_log_enabled = false
+    }
+
+    maintenance_window {
+      day          = 7  # Sunday
+      hour         = 2  # 2 AM
+      update_track = "stable"
+    }
+
+    ip_configuration {
+      ipv4_enabled    = true
+      private_network = google_compute_network.chatbot_network.id
+    }
+
+    database_flags {
+      name  = "max_connections"
+      value = "100"
+    }
   }
-  
-  alarm_description = "This alarm triggers when CPU usage is low"
-  alarm_actions     = [aws_autoscaling_policy.scale_down.arn]
-  
-  tags = {
+
+  deletion_protection = false  # 실제 운영 환경에서는 true로 설정
+
+  labels = {
     project     = "ai-infra"
     environment = "production"
   }
 }
 
-resource "aws_autoscaling_policy" "scale_down" {
-  name                   = "chatbot-scale-down"
-  scaling_adjustment     = -1
-  adjustment_type        = "ChangeInCapacity"
-  cooldown               = 300
-  autoscaling_group_name = aws_autoscaling_group.chatbot_asg.name
+# 데이터베이스 생성
+resource "google_sql_database" "chatbot_database" {
+  name     = "chatbotdb"
+  instance = google_sql_database_instance.chatbot_db.name
+  project  = var.project_id
 }
 
-# Output values
-output "instance_ip" {
-  value = aws_eip.chatbot_eip.public_ip
+# 데이터베이스 사용자 생성
+resource "google_sql_user" "chatbot_user" {
+  name     = "chatbot_user"
+  instance = google_sql_database_instance.chatbot_db.name
+  password = "changeme"  # 실제 환경에서는 Secret Manager 사용 권장
+  project  = var.project_id
 }
 
-output "alb_dns_name" {
-  value = aws_lb.chatbot_alb.dns_name
+# Load Balancer를 위한 인스턴스 그룹
+resource "google_compute_instance_group" "chatbot_instance_group" {
+  name        = "chatbot-instance-group"
+  zone        = "asia-northeast3-a"
+  instances   = [google_compute_instance.chatbot_server.id]
+  project     = var.project_id
+
+  named_port {
+    name = "http"
+    port = 8080
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
-output "model_bucket_name" {
-  value = aws_s3_bucket.model_bucket.bucket
+# 상태 점검
+resource "google_compute_health_check" "chatbot_health_check" {
+  name                = "chatbot-health-check"
+  check_interval_sec  = 5
+  timeout_sec         = 5
+  healthy_threshold   = 2
+  unhealthy_threshold = 2
+  project             = var.project_id
+
+  http_health_check {
+    port         = 8080
+    request_path = "/health"
+  }
+}
+
+# 백엔드 서비스
+resource "google_compute_backend_service" "chatbot_backend" {
+  name                  = "chatbot-backend-service"
+  project               = var.project_id
+  port_name             = "http"
+  protocol              = "HTTP"
+  load_balancing_scheme = "EXTERNAL"
+  timeout_sec           = 30
+  health_checks         = [google_compute_health_check.chatbot_health_check.id]
+
+  backend {
+    group = google_compute_instance_group.chatbot_instance_group.id
+  }
+}
+
+# URL 맵
+resource "google_compute_url_map" "chatbot_url_map" {
+  name            = "chatbot-url-map"
+  default_service = google_compute_backend_service.chatbot_backend.id
+  project         = var.project_id
+}
+
+# HTTPS 프록시
+resource "google_compute_target_https_proxy" "chatbot_https_proxy" {
+  name             = "chatbot-https-proxy"
+  url_map          = google_compute_url_map.chatbot_url_map.id
+  ssl_certificates = [google_compute_managed_ssl_certificate.chatbot_cert.id]
+  project          = var.project_id
+}
+
+# SSL 인증서
+resource "google_compute_managed_ssl_certificate" "chatbot_cert" {
+  name     = "chatbot-cert"
+  project  = var.project_id
+
+  managed {
+    domains = ["chatbot.example.com"]  # 실제 도메인으로 변경 필요
+  }
+}
+
+# 전역 전달 규칙
+resource "google_compute_global_forwarding_rule" "chatbot_forwarding_rule" {
+  name                  = "chatbot-forwarding-rule"
+  target                = google_compute_target_https_proxy.chatbot_https_proxy.id
+  port_range            = "443"
+  load_balancing_scheme = "EXTERNAL"
+  project               = var.project_id
+}
+
+# Redis Cache (세션 및 캐싱)
+resource "google_redis_instance" "chatbot_cache" {
+  name           = "chatbot-cache"
+  tier           = "BASIC"
+  memory_size_gb = 1
+  region         = "asia-northeast3"
+  project        = var.project_id
+  
+  authorized_network = google_compute_network.chatbot_network.id
+  redis_version      = "REDIS_6_X"
+  
+  maintenance_policy {
+    day      = "SUNDAY"
+    start_time {
+      hours   = 2
+      minutes = 0
+    }
+  }
+
+  labels = {
+    project     = "ai-infra"
+    environment = "production"
+  }
+}
+
+# Cloud Storage 버킷 (모델 및 데이터 저장)
+resource "google_storage_bucket" "chatbot_model_storage" {
+  name          = "chatbot-model-storage-${var.project_id}"
+  location      = "ASIA-NORTHEAST3"
+  storage_class = "STANDARD"
+  project       = var.project_id
+  
+  uniform_bucket_level_access = true
+  
+  versioning {
+    enabled = true
+  }
+
+  labels = {
+    project     = "ai-infra"
+    environment = "production"
+  }
+}
+
+# Auto Scaling 설정을 위한 인스턴스 템플릿
+resource "google_compute_instance_template" "chatbot_template" {
+  name_prefix  = "chatbot-template-"
+  machine_type = "g2-standard-8"
+  project      = var.project_id
+
+  disk {
+    source_image = "debian-cloud/debian-11"
+    auto_delete  = true
+    boot         = true
+    disk_type    = "pd-balanced"
+    disk_size_gb = 100
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.chatbot_subnet.id
+    access_config {
+      # 외부 IP 할당
+    }
+  }
+
+  scheduling {
+    on_host_maintenance = "TERMINATE"  # GPU VM의 경우 필수
+    automatic_restart   = true
+  }
+
+  guest_accelerator {
+    type  = "nvidia-l4"
+    count = 1
+  }
+
+  service_account {
+    scopes = ["cloud-platform"]
+  }
+
+  metadata_startup_script = <<-EOF
+    #!/bin/bash
+    apt-get update
+    apt-get install -y build-essential python3-pip
+    pip3 install torch numpy transformers
+    # GPU 드라이버 설치
+    curl https://raw.githubusercontent.com/GoogleCloudPlatform/compute-gpu-installation/main/linux/install_gpu_driver.py -o install_gpu_driver.py
+    python3 install_gpu_driver.py
+  EOF
+
+  tags = ["chatbot-server"]
+
+  labels = {
+    project     = "ai-infra"
+    environment = "production"
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# 관리형 인스턴스 그룹 (MIG)
+resource "google_compute_region_instance_group_manager" "chatbot_mig" {
+  name                      = "chatbot-mig"
+  base_instance_name        = "chatbot"
+  region                    = "asia-northeast3"
+  distribution_policy_zones = ["asia-northeast3-a", "asia-northeast3-b"]
+  project                   = var.project_id
+
+  version {
+    instance_template = google_compute_instance_template.chatbot_template.id
+  }
+
+  named_port {
+    name = "http"
+    port = 8080
+  }
+
+  auto_healing_policies {
+    health_check      = google_compute_health_check.chatbot_health_check.id
+    initial_delay_sec = 300
+  }
+
+  target_size = 1  # 초기 인스턴스 수
+}
+
+# 자동 확장 정책
+resource "google_compute_region_autoscaler" "chatbot_autoscaler" {
+  name   = "chatbot-autoscaler"
+  region = "asia-northeast3"
+  target = google_compute_region_instance_group_manager.chatbot_mig.id
+  project = var.project_id
+
+  autoscaling_policy {
+    max_replicas    = 5
+    min_replicas    = 1
+    cooldown_period = 60
+
+    cpu_utilization {
+      target = 0.6  # 60% CPU 사용률을 초과하면 확장
+    }
+  }
+}
+
+# Cloud Monitoring 알림 정책
+resource "google_monitoring_alert_policy" "high_cpu_usage" {
+  display_name = "High CPU Usage Alert"
+  project      = var.project_id
+  combiner     = "OR"
+  
+  conditions {
+    display_name = "VM Instance CPU utilization"
+    
+    condition_threshold {
+      filter          = "metric.type=\"compute.googleapis.com/instance/cpu/utilization\" AND resource.type=\"gce_instance\" AND metadata.user_labels.project=\"ai-infra\""
+      duration        = "60s"
+      comparison      = "COMPARISON_GT"
+      threshold_value = 0.8  # 80% CPU 사용률 초과 시 알림
+      
+      aggregations {
+        alignment_period     = "60s"
+        per_series_aligner   = "ALIGN_MEAN"
+        cross_series_reducer = "REDUCE_MEAN"
+      }
+    }
+  }
+
+  notification_channels = []  # 알림 채널 ID 추가 필요
+  
+  documentation {
+    content   = "CPU usage is above 80% for more than 1 minute. Please check the instance."
+    mime_type = "text/markdown"
+  }
+
+  alert_strategy {
+    auto_close = "1800s"  # 30분 동안 조건이 해결되면 자동 종료
+  }
 }
