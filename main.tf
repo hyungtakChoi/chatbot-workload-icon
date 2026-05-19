@@ -3,7 +3,6 @@
 # GCP Terraform - 실시간 고객 상담 챗봇 AI 서비스
 # CSP: GCP | Region: asia-northeast3 (Seoul)
 # Model: GPT-1/2 (Transformer) | Monthly Users: 100,000
-# Tags: project=ai-infra, environment=production
 # ============================================================
 
 terraform {
@@ -18,7 +17,8 @@ terraform {
 
 provider "google" {
   project = var.project_id
-  region  = var.region
+  region  = "asia-northeast3"
+  zone    = "asia-northeast3-a"
 }
 
 # ============================================================
@@ -31,27 +31,11 @@ variable "project_id" {
 }
 
 variable "region" {
-  description = "GCP Region"
-  type        = string
-  default     = "asia-northeast3"
+  default = "asia-northeast3"
 }
 
 variable "zone" {
-  description = "GCP Zone"
-  type        = string
-  default     = "asia-northeast3-a"
-}
-
-variable "gke_cluster_name" {
-  description = "GKE Cluster Name"
-  type        = string
-  default     = "chatbot-ai-cluster"
-}
-
-variable "environment" {
-  description = "Environment"
-  type        = string
-  default     = "production"
+  default = "asia-northeast3-a"
 }
 
 # ============================================================
@@ -59,46 +43,38 @@ variable "environment" {
 # ============================================================
 
 resource "google_compute_network" "chatbot_vpc" {
-  name                    = "chatbot-ai-vpc"
+  name                    = "chatbot-vpc"
   auto_create_subnetworks = false
 
-  description = "VPC for chatbot AI service"
+  labels = {
+    project     = "ai-infra"
+    environment = "production"
+  }
 }
 
-resource "google_compute_subnetwork" "chatbot_subnet" {
-  name          = "chatbot-ai-subnet"
-  ip_cidr_range = "10.10.0.0/16"
+resource "google_compute_subnetwork" "chatbot_subnet_public" {
+  name          = "chatbot-subnet-public"
+  ip_cidr_range = "10.0.1.0/24"
   region        = var.region
   network       = google_compute_network.chatbot_vpc.id
-
-  secondary_ip_range {
-    range_name    = "gke-pods"
-    ip_cidr_range = "10.20.0.0/16"
-  }
-
-  secondary_ip_range {
-    range_name    = "gke-services"
-    ip_cidr_range = "10.30.0.0/16"
-  }
 }
 
-resource "google_compute_subnetwork" "chatbot_private_subnet" {
-  name                     = "chatbot-ai-private-subnet"
-  ip_cidr_range            = "10.40.0.0/16"
+resource "google_compute_subnetwork" "chatbot_subnet_private" {
+  name                     = "chatbot-subnet-private"
+  ip_cidr_range            = "10.0.2.0/24"
   region                   = var.region
   network                  = google_compute_network.chatbot_vpc.id
   private_ip_google_access = true
 }
 
-# Cloud Router & NAT (Spot VM 인터넷 접근용)
 resource "google_compute_router" "chatbot_router" {
-  name    = "chatbot-ai-router"
+  name    = "chatbot-router"
   region  = var.region
   network = google_compute_network.chatbot_vpc.id
 }
 
 resource "google_compute_router_nat" "chatbot_nat" {
-  name                               = "chatbot-ai-nat"
+  name                               = "chatbot-nat"
   router                             = google_compute_router.chatbot_router.name
   region                             = var.region
   nat_ip_allocate_option             = "AUTO_ONLY"
@@ -109,6 +85,19 @@ resource "google_compute_router_nat" "chatbot_nat" {
 # Firewall Rules
 # ============================================================
 
+resource "google_compute_firewall" "allow_http_https" {
+  name    = "chatbot-allow-http-https"
+  network = google_compute_network.chatbot_vpc.name
+
+  allow {
+    protocol = "tcp"
+    ports    = ["80", "443", "8080"]
+  }
+
+  source_ranges = ["0.0.0.0/0"]
+  target_tags   = ["chatbot-api"]
+}
+
 resource "google_compute_firewall" "allow_internal" {
   name    = "chatbot-allow-internal"
   network = google_compute_network.chatbot_vpc.name
@@ -117,64 +106,28 @@ resource "google_compute_firewall" "allow_internal" {
     protocol = "tcp"
     ports    = ["0-65535"]
   }
+
   allow {
     protocol = "udp"
     ports    = ["0-65535"]
   }
-  allow {
-    protocol = "icmp"
-  }
 
-  source_ranges = ["10.0.0.0/8"]
-
-  target_tags = ["chatbot-internal"]
-}
-
-resource "google_compute_firewall" "allow_health_check" {
-  name    = "chatbot-allow-health-check"
-  network = google_compute_network.chatbot_vpc.name
-
-  allow {
-    protocol = "tcp"
-    ports    = ["8080", "8443"]
-  }
-
-  source_ranges = ["130.211.0.0/22", "35.191.0.0/16"]
-  target_tags   = ["chatbot-gke-node"]
+  source_ranges = ["10.0.0.0/16"]
 }
 
 # ============================================================
-# GKE Cluster (GPU 추론 서버)
+# GKE Cluster (GPU Node Pool 포함)
 # ============================================================
 
-resource "google_container_cluster" "chatbot_cluster" {
-  name     = var.gke_cluster_name
-  location = var.region
+resource "google_container_cluster" "chatbot_gke" {
+  name     = "chatbot-gke-cluster"
+  location = var.zone
 
   network    = google_compute_network.chatbot_vpc.name
-  subnetwork = google_compute_subnetwork.chatbot_subnet.name
+  subnetwork = google_compute_subnetwork.chatbot_subnet_private.name
 
-  # Default node pool 제거 후 별도 관리
   remove_default_node_pool = true
   initial_node_count       = 1
-
-  ip_allocation_policy {
-    cluster_secondary_range_name  = "gke-pods"
-    services_secondary_range_name = "gke-services"
-  }
-
-  private_cluster_config {
-    enable_private_nodes    = true
-    enable_private_endpoint = false
-    master_ipv4_cidr_block  = "172.16.0.0/28"
-  }
-
-  master_authorized_networks_config {
-    cidr_blocks {
-      cidr_block   = "0.0.0.0/0"
-      display_name = "all"
-    }
-  }
 
   workload_identity_config {
     workload_pool = "${var.project_id}.svc.id.goog"
@@ -195,33 +148,52 @@ resource "google_container_cluster" "chatbot_cluster" {
   }
 }
 
-# ============================================================
-# GKE Node Pool - GPU (L4 24GB) for GPT Inference
-# Spot VM으로 비용 최적화 (최대 60~70% 절감)
-# ============================================================
+# CPU Node Pool (API 서버용)
+resource "google_container_node_pool" "cpu_nodes" {
+  name       = "cpu-node-pool"
+  location   = var.zone
+  cluster    = google_container_cluster.chatbot_gke.name
+  node_count = 2
 
-resource "google_container_node_pool" "gpu_spot_pool" {
-  name       = "gpu-spot-node-pool"
-  location   = var.region
-  cluster    = google_container_cluster.chatbot_cluster.name
-
-  # Auto Scaling: 최소 1 ~ 최대 5 노드
   autoscaling {
     min_node_count = 1
     max_node_count = 5
   }
 
-  management {
-    auto_repair  = true
-    auto_upgrade = true
+  node_config {
+    machine_type = "e2-standard-4"
+    disk_size_gb = 50
+    disk_type    = "pd-ssd"
+
+    oauth_scopes = [
+      "https://www.googleapis.com/auth/cloud-platform"
+    ]
+
+    labels = {
+      project     = "ai-infra"
+      environment = "production"
+      node-type   = "cpu"
+    }
+  }
+}
+
+# GPU Node Pool (GPT 추론 서버용 - g2-standard-4, NVIDIA L4 24GB)
+resource "google_container_node_pool" "gpu_nodes" {
+  name     = "gpu-node-pool"
+  location = var.zone
+  cluster  = google_container_cluster.chatbot_gke.name
+
+  autoscaling {
+    min_node_count = 1
+    max_node_count = 4
   }
 
   node_config {
-    machine_type = "g2-standard-4"   # L4 GPU (24GB VRAM), 4 vCPU, 16GB RAM
+    machine_type = "g2-standard-4"
+    disk_size_gb = 100
+    disk_type    = "pd-ssd"
 
-    # Spot VM 활성화 (비용 최대 70% 절감)
-    spot = true
-
+    # NVIDIA L4 GPU (24GB VRAM) - GPT-2 추론 최적
     guest_accelerator {
       type  = "nvidia-l4"
       count = 1
@@ -230,19 +202,18 @@ resource "google_container_node_pool" "gpu_spot_pool" {
       }
     }
 
-    disk_size_gb = 100
-    disk_type    = "pd-ssd"
+    # Spot VM 활용 (최대 90% 비용 절감)
+    spot = true
 
     oauth_scopes = [
       "https://www.googleapis.com/auth/cloud-platform"
     ]
 
-    tags = ["chatbot-gke-node", "chatbot-internal"]
-
     labels = {
       project     = "ai-infra"
       environment = "production"
-      node-type   = "gpu-inference"
+      node-type   = "gpu"
+      workload    = "gpt-inference"
     }
 
     taint {
@@ -253,51 +224,13 @@ resource "google_container_node_pool" "gpu_spot_pool" {
   }
 }
 
-# GKE Node Pool - CPU (API 서버, 일반 워크로드)
-resource "google_container_node_pool" "cpu_pool" {
-  name       = "cpu-node-pool"
-  location   = var.region
-  cluster    = google_container_cluster.chatbot_cluster.name
-
-  autoscaling {
-    min_node_count = 1
-    max_node_count = 5
-  }
-
-  management {
-    auto_repair  = true
-    auto_upgrade = true
-  }
-
-  node_config {
-    machine_type = "e2-standard-4"   # 4 vCPU, 16GB RAM (비용 효율 최고)
-    spot         = true
-
-    disk_size_gb = 50
-    disk_type    = "pd-standard"
-
-    oauth_scopes = [
-      "https://www.googleapis.com/auth/cloud-platform"
-    ]
-
-    tags = ["chatbot-gke-node", "chatbot-internal"]
-
-    labels = {
-      project     = "ai-infra"
-      environment = "production"
-      node-type   = "cpu-api"
-    }
-  }
-}
-
 # ============================================================
 # Cloud Memorystore (Redis) - 추론 응답 캐싱
-# 반복 질문 30~50% GPU 추론 생략 → 비용 절감
 # ============================================================
 
 resource "google_redis_instance" "chatbot_cache" {
-  name           = "chatbot-ai-redis"
-  tier           = "STANDARD_HA"       # HA 구성 (실시간 서비스 필수)
+  name           = "chatbot-redis-cache"
+  tier           = "STANDARD_HA"
   memory_size_gb = 4
   region         = var.region
 
@@ -305,10 +238,10 @@ resource "google_redis_instance" "chatbot_cache" {
   connect_mode       = "PRIVATE_SERVICE_ACCESS"
 
   redis_version = "REDIS_7_0"
+  display_name  = "Chatbot Inference Cache"
 
   redis_configs = {
-    maxmemory-policy = "allkeys-lru"   # LRU 캐시 정책
-    maxmemory-gb     = "3.2"
+    maxmemory-policy = "allkeys-lru"
   }
 
   labels = {
@@ -318,25 +251,25 @@ resource "google_redis_instance" "chatbot_cache" {
 }
 
 # ============================================================
-# Firestore - 대화 이력 저장
+# Cloud Firestore - 대화 이력 저장
 # ============================================================
 
 resource "google_firestore_database" "chatbot_db" {
   project     = var.project_id
   name        = "chatbot-conversation-db"
-  location_id = var.region
+  location_id = "asia-northeast3"
   type        = "FIRESTORE_NATIVE"
 
   deletion_policy = "DELETE"
 }
 
 # ============================================================
-# Cloud Storage - 모델 파일 저장 (GPT-1/2 weights)
+# Cloud Storage - 모델 파일 저장
 # ============================================================
 
-resource "google_storage_bucket" "model_bucket" {
-  name          = "${var.project_id}-chatbot-model-weights"
-  location      = var.region
+resource "google_storage_bucket" "model_storage" {
+  name          = "${var.project_id}-chatbot-model-storage"
+  location      = "ASIA-NORTHEAST3"
   force_destroy = false
 
   storage_class = "STANDARD"
@@ -361,9 +294,9 @@ resource "google_storage_bucket" "model_bucket" {
   }
 }
 
-resource "google_storage_bucket" "log_bucket" {
-  name          = "${var.project_id}-chatbot-logs"
-  location      = var.region
+resource "google_storage_bucket" "log_storage" {
+  name          = "${var.project_id}-chatbot-log-storage"
+  location      = "ASIA-NORTHEAST3"
   force_destroy = false
 
   storage_class = "STANDARD"
@@ -385,23 +318,28 @@ resource "google_storage_bucket" "log_bucket" {
 }
 
 # ============================================================
-# Cloud Load Balancing (HTTPS) + Cloud CDN + Cloud Armor
+# Cloud Load Balancing + Cloud CDN
 # ============================================================
 
-# Static IP for Load Balancer
-resource "google_compute_global_address" "chatbot_lb_ip" {
-  name = "chatbot-ai-lb-ip"
+resource "google_compute_global_address" "chatbot_ip" {
+  name = "chatbot-global-ip"
 }
 
-# Backend Service (GKE 연동)
+resource "google_compute_managed_ssl_certificate" "chatbot_ssl" {
+  name = "chatbot-ssl-cert"
+
+  managed {
+    domains = ["chatbot.${var.project_id}.example.com"]
+  }
+}
+
 resource "google_compute_backend_service" "chatbot_backend" {
-  name                  = "chatbot-ai-backend"
+  name                  = "chatbot-backend-service"
   protocol              = "HTTP"
   port_name             = "http"
-  timeout_sec           = 30
   load_balancing_scheme = "EXTERNAL_MANAGED"
+  timeout_sec           = 30
 
-  # Cloud CDN 활성화 (정적 응답 캐싱)
   enable_cdn = true
 
   cdn_policy {
@@ -412,59 +350,103 @@ resource "google_compute_backend_service" "chatbot_backend" {
     signed_url_cache_max_age_sec = 7200
   }
 
-  # Cloud Armor 보안 정책 연결
-  security_policy = google_compute_security_policy.chatbot_armor.id
-
-  health_checks = [google_compute_health_check.chatbot_hc.id]
-
   log_config {
     enable      = true
     sample_rate = 1.0
   }
 }
 
-# Health Check
-resource "google_compute_health_check" "chatbot_hc" {
-  name               = "chatbot-ai-health-check"
-  check_interval_sec = 10
-  timeout_sec        = 5
-
-  http_health_check {
-    port         = 8080
-    request_path = "/health"
-  }
-}
-
-# URL Map
 resource "google_compute_url_map" "chatbot_url_map" {
-  name            = "chatbot-ai-url-map"
+  name            = "chatbot-url-map"
   default_service = google_compute_backend_service.chatbot_backend.id
 }
 
-# HTTPS Proxy
 resource "google_compute_target_https_proxy" "chatbot_https_proxy" {
-  name    = "chatbot-ai-https-proxy"
-  url_map = google_compute_url_map.chatbot_url_map.id
-
+  name             = "chatbot-https-proxy"
+  url_map          = google_compute_url_map.chatbot_url_map.id
   ssl_certificates = [google_compute_managed_ssl_certificate.chatbot_ssl.id]
 }
 
-# Managed SSL Certificate
-resource "google_compute_managed_ssl_certificate" "chatbot_ssl" {
-  name = "chatbot-ai-ssl-cert"
+resource "google_compute_global_forwarding_rule" "chatbot_forwarding_rule" {
+  name                  = "chatbot-forwarding-rule"
+  ip_protocol           = "TCP"
+  load_balancing_scheme = "EXTERNAL_MANAGED"
+  port_range            = "443"
+  target                = google_compute_target_https_proxy.chatbot_https_proxy.id
+  ip_address            = google_compute_global_address.chatbot_ip.id
+}
 
-  managed {
-    domains = ["chatbot.ai-infra.example.com"]
+# ============================================================
+# Cloud API Gateway
+# ============================================================
+
+resource "google_api_gateway_api" "chatbot_api" {
+  provider = google
+  api_id   = "chatbot-api"
+}
+
+resource "google_api_gateway_api_config" "chatbot_api_config" {
+  provider      = google
+  api           = google_api_gateway_api.chatbot_api.api_id
+  api_config_id = "chatbot-api-config-v1"
+
+  openapi_documents {
+    document {
+      path = "spec.yaml"
+      contents = base64encode(<<-EOF
+        swagger: "2.0"
+        info:
+          title: Chatbot AI API
+          description: 실시간 고객 상담 챗봇 AI API
+          version: "1.0.0"
+        host: chatbot-api.example.com
+        schemes:
+          - https
+        paths:
+          /chat:
+            post:
+              summary: 챗봇 메시지 전송
+              operationId: sendMessage
+              consumes:
+                - application/json
+              produces:
+                - application/json
+              parameters:
+                - in: body
+                  name: body
+                  schema:
+                    type: object
+                    properties:
+                      message:
+                        type: string
+                      session_id:
+                        type: string
+              responses:
+                "200":
+                  description: 챗봇 응답
+          /health:
+            get:
+              summary: 헬스체크
+              operationId: healthCheck
+              responses:
+                "200":
+                  description: OK
+      EOF
+      )
+    }
+  }
+
+  labels = {
+    project     = "ai-infra"
+    environment = "production"
   }
 }
 
-# Global Forwarding Rule
-resource "google_compute_global_forwarding_rule" "chatbot_forwarding_rule" {
-  name                  = "chatbot-ai-forwarding-rule"
-  ip_address            = google_compute_global_address.chatbot_lb_ip.address
-  port_range            = "443"
-  target                = google_compute_target_https_proxy.chatbot_https_proxy.id
-  load_balancing_scheme = "EXTERNAL_MANAGED"
+resource "google_api_gateway_gateway" "chatbot_gateway" {
+  provider   = google
+  api_config = google_api_gateway_api_config.chatbot_api_config.id
+  gateway_id = "chatbot-gateway"
+  region     = var.region
 
   labels = {
     project     = "ai-infra"
@@ -473,67 +455,11 @@ resource "google_compute_global_forwarding_rule" "chatbot_forwarding_rule" {
 }
 
 # ============================================================
-# Cloud Armor - DDoS 방어 및 WAF
-# ============================================================
-
-resource "google_compute_security_policy" "chatbot_armor" {
-  name = "chatbot-ai-armor-policy"
-
-  # DDoS 자동 방어
-  adaptive_protection_config {
-    layer_7_ddos_defense_config {
-      enable          = true
-      rule_visibility = "STANDARD"
-    }
-  }
-
-  # Rate Limiting (IP당 분당 100 요청 제한)
-  rule {
-    action   = "throttle"
-    priority = 1000
-
-    match {
-      versioned_expr = "SRC_IPS_V1"
-      config {
-        src_ip_ranges = ["*"]
-      }
-    }
-
-    rate_limit_options {
-      conform_action = "allow"
-      exceed_action  = "deny(429)"
-      enforce_on_key = "IP"
-      rate_limit_threshold {
-        count        = 100
-        interval_sec = 60
-      }
-    }
-
-    description = "Rate limiting per IP"
-  }
-
-  # 기본 허용 규칙
-  rule {
-    action   = "allow"
-    priority = 2147483647
-
-    match {
-      versioned_expr = "SRC_IPS_V1"
-      config {
-        src_ip_ranges = ["*"]
-      }
-    }
-
-    description = "Default allow rule"
-  }
-}
-
-# ============================================================
 # Cloud Monitoring & Alerting
 # ============================================================
 
-resource "google_monitoring_notification_channel" "email_channel" {
-  display_name = "Chatbot AI Alert Email"
+resource "google_monitoring_notification_channel" "email_alert" {
+  display_name = "Chatbot Alert Email"
   type         = "email"
 
   labels = {
@@ -547,7 +473,6 @@ resource "google_monitoring_alert_policy" "gpu_utilization_alert" {
 
   conditions {
     display_name = "GPU Utilization > 85%"
-
     condition_threshold {
       filter          = "metric.type=\"kubernetes.io/node/accelerator/duty_cycle\" resource.type=\"k8s_node\""
       duration        = "300s"
@@ -561,44 +486,43 @@ resource "google_monitoring_alert_policy" "gpu_utilization_alert" {
     }
   }
 
-  notification_channels = [google_monitoring_notification_channel.email_channel.id]
+  notification_channels = [google_monitoring_notification_channel.email_alert.name]
 
   alert_strategy {
     auto_close = "1800s"
   }
 }
 
-resource "google_monitoring_alert_policy" "redis_memory_alert" {
-  display_name = "Redis Memory Usage High Alert"
+resource "google_monitoring_alert_policy" "latency_alert" {
+  display_name = "API Latency High Alert"
   combiner     = "OR"
 
   conditions {
-    display_name = "Redis Memory > 80%"
-
+    display_name = "API Latency > 3s"
     condition_threshold {
-      filter          = "metric.type=\"redis.googleapis.com/stats/memory/usage_ratio\" resource.type=\"redis_instance\""
-      duration        = "300s"
+      filter          = "metric.type=\"loadbalancing.googleapis.com/https/total_latencies\" resource.type=\"https_lb_rule\""
+      duration        = "120s"
       comparison      = "COMPARISON_GT"
-      threshold_value = 0.8
+      threshold_value = 3000
 
       aggregations {
         alignment_period   = "60s"
-        per_series_aligner = "ALIGN_MEAN"
+        per_series_aligner = "ALIGN_PERCENTILE_99"
       }
     }
   }
 
-  notification_channels = [google_monitoring_notification_channel.email_channel.id]
+  notification_channels = [google_monitoring_notification_channel.email_alert.name]
 }
 
 # ============================================================
-# IAM - Workload Identity (GKE → GCP 서비스 접근)
+# IAM - Service Account
 # ============================================================
 
 resource "google_service_account" "chatbot_sa" {
-  account_id   = "chatbot-ai-sa"
-  display_name = "Chatbot AI Service Account"
-  description  = "Service account for chatbot AI GKE workloads"
+  account_id   = "chatbot-inference-sa"
+  display_name = "Chatbot Inference Service Account"
+  description  = "GPT 추론 서버용 서비스 계정"
 }
 
 resource "google_project_iam_member" "chatbot_sa_storage" {
@@ -619,50 +543,43 @@ resource "google_project_iam_member" "chatbot_sa_monitoring" {
   member  = "serviceAccount:${google_service_account.chatbot_sa.email}"
 }
 
-# Workload Identity Binding
-resource "google_service_account_iam_member" "workload_identity_binding" {
-  service_account_id = google_service_account.chatbot_sa.name
-  role               = "roles/iam.workloadIdentityUser"
-  member             = "serviceAccount:${var.project_id}.svc.id.goog[chatbot/chatbot-ai-ksa]"
-}
-
 # ============================================================
 # Outputs
 # ============================================================
 
 output "gke_cluster_name" {
-  description = "GKE Cluster Name"
-  value       = google_container_cluster.chatbot_cluster.name
+  value       = google_container_cluster.chatbot_gke.name
+  description = "GKE 클러스터 이름"
 }
 
 output "gke_cluster_endpoint" {
-  description = "GKE Cluster Endpoint"
-  value       = google_container_cluster.chatbot_cluster.endpoint
+  value       = google_container_cluster.chatbot_gke.endpoint
+  description = "GKE 클러스터 엔드포인트"
+  sensitive   = true
+}
+
+output "redis_host" {
+  value       = google_redis_instance.chatbot_cache.host
+  description = "Redis 캐시 호스트"
   sensitive   = true
 }
 
 output "load_balancer_ip" {
-  description = "Load Balancer External IP"
-  value       = google_compute_global_address.chatbot_lb_ip.address
+  value       = google_compute_global_address.chatbot_ip.address
+  description = "로드밸런서 글로벌 IP"
 }
 
-output "redis_host" {
-  description = "Redis Instance Host"
-  value       = google_redis_instance.chatbot_cache.host
-  sensitive   = true
+output "api_gateway_url" {
+  value       = google_api_gateway_gateway.chatbot_gateway.default_hostname
+  description = "API Gateway URL"
 }
 
-output "model_bucket_name" {
-  description = "GCS Bucket for Model Weights"
-  value       = google_storage_bucket.model_bucket.name
-}
-
-output "service_account_email" {
-  description = "Chatbot Service Account Email"
-  value       = google_service_account.chatbot_sa.email
+output "model_storage_bucket" {
+  value       = google_storage_bucket.model_storage.name
+  description = "모델 파일 저장 버킷"
 }
 
 output "monthly_cost_estimate" {
-  description = "Estimated Monthly Cost (USD)"
-  value       = "~$370 (Spot VM + Committed Use Discounts 적용 기준)"
+  value       = "예상 월 비용: ~$370 (Spot VM + CUD 1년 약정 기준)"
+  description = "월 예상 비용"
 }
